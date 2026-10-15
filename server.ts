@@ -1,0 +1,237 @@
+// Minimal Wisp relay (v1 + v2) for Scramjet, targeting Deno Deploy.
+//
+// It multiplexes TCP streams over one WebSocket, following the Wisp protocol:
+//   https://github.com/MercuryWorkshop/wisp-protocol
+//
+// Deploy (Deno Deploy): create a project, drop this file in as the entrypoint,
+// and it listens on the platform port. Locally:
+//     deno run --allow-net --allow-env server.ts
+//
+// Then set the Flask app's BROWSER_WISP_URL to the relay's wss:// URL, e.g.
+//     BROWSER_WISP_URL=wss://my-relay.deno.dev/
+//
+// Heads-up: this is an open TCP proxy. It is intended to sit behind the
+// login-gated /browser page. Set the WISP_TOKEN secret to require a token in
+// the query string (?token=...) if you want to keep the URL private.
+
+const WISP_TOKEN = Deno.env.get("WISP_TOKEN") ?? "";
+
+const PACKET_CONNECT = 0x01;
+const PACKET_DATA = 0x02;
+const PACKET_CONTINUE = 0x03;
+const PACKET_CLOSE = 0x04;
+const PACKET_INFO = 0x05;
+
+const STREAM_TCP = 0x01;
+
+const CLOSE_VOLUNTARY = 0x02;
+const CLOSE_NETWORK = 0x03;
+const CLOSE_INVALID = 0x41;
+const CLOSE_UNREACHABLE = 0x42;
+
+const BUFFER_SIZE = 128;
+
+function makePacket(type: number, streamId: number, payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(5 + payload.length);
+  const view = new DataView(out.buffer);
+  view.setUint8(0, type);
+  view.setUint32(1, streamId >>> 0, true);
+  if (payload.length) out.set(payload, 5);
+  return out;
+}
+
+function continuePacket(streamId: number, remaining: number): Uint8Array {
+  const p = new Uint8Array(4);
+  new DataView(p.buffer).setUint32(0, remaining >>> 0, true);
+  return makePacket(PACKET_CONTINUE, streamId, p);
+}
+
+function closePacket(streamId: number, reason: number): Uint8Array {
+  return makePacket(PACKET_CLOSE, streamId, new Uint8Array([reason]));
+}
+
+function infoPacket(): Uint8Array {
+  return makePacket(PACKET_INFO, 0, new Uint8Array([2, 0]));
+}
+
+interface Stream {
+  id: number;
+  conn?: Deno.TcpConn;
+  queue: Uint8Array[];
+  writing: boolean;
+  closed: boolean;
+  sent: number;
+}
+
+Deno.serve((req: Request): Response => {
+  if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return new Response("Wisp relay is running.\n", { status: 200 });
+  }
+  if (WISP_TOKEN) {
+    const token = new URL(req.url).searchParams.get("token");
+    if (token !== WISP_TOKEN) return new Response("Forbidden", { status: 403 });
+  }
+
+  // wisp-js sends a Sec-WebSocket-Protocol header to negotiate wisp v2.
+  const requested = req.headers.get("sec-websocket-protocol");
+  const options: Deno.UpgradeWebSocketOptions = {};
+  if (requested) options.protocol = requested.split(",")[0].trim();
+  const { socket, response } = Deno.upgradeWebSocket(req, options);
+  handleSocket(socket, Boolean(requested));
+  return response;
+});
+
+function handleSocket(ws: WebSocket, isV2: boolean) {
+  const streams = new Map<number, Stream>();
+  let handshakeDone = false;
+
+  (ws as unknown as { binaryType: string }).binaryType = "arraybuffer";
+
+  const send = (data: Uint8Array) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+  };
+
+  ws.onopen = () => {
+    if (isV2) {
+      send(infoPacket());
+    } else {
+      send(continuePacket(0, BUFFER_SIZE));
+      handshakeDone = true;
+    }
+  };
+
+  ws.onmessage = (event: MessageEvent) => {
+    const data = event.data;
+    if (typeof data === "string") return;
+    const bytes = data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : new Uint8Array((data as Uint8Array).buffer);
+    route(bytes);
+  };
+
+  ws.onclose = () => {
+    for (const s of streams.values()) closeStream(s, false);
+    streams.clear();
+  };
+
+  // Each WebSocket message carries a single Wisp packet (as produced by the
+  // wisp-js client). DATA payloads consume the rest of the frame, so per-message
+  // parsing is unambiguous.
+  function route(buf: Uint8Array) {
+    if (buf.length < 5) return;
+    const view = new DataView(buf.buffer, buf.byteOffset, buf.length);
+    const type = view.getUint8(0);
+    const streamId = view.getUint32(1, true);
+    const payload = buf.subarray(5);
+    handlePacket(type, streamId, payload);
+  }
+
+  function handlePacket(type: number, streamId: number, payload: Uint8Array) {
+    if (type === PACKET_INFO) {
+      if (isV2 && !handshakeDone) {
+        send(continuePacket(0, BUFFER_SIZE));
+        handshakeDone = true;
+      }
+      return;
+    }
+    if (type === PACKET_CONNECT) {
+      if (payload.length < 3) {
+        send(closePacket(streamId, CLOSE_INVALID));
+        return;
+      }
+      const streamType = payload[0];
+      const port = new DataView(payload.buffer, payload.byteOffset).getUint16(1, true);
+      const hostname = new TextDecoder().decode(payload.subarray(3));
+      void connectStream(streamId, streamType, hostname, port);
+    } else if (type === PACKET_DATA) {
+      const s = streams.get(streamId);
+      if (s) {
+        s.queue.push(payload.slice());
+        void pump(s);
+      }
+    } else if (type === PACKET_CLOSE) {
+      const s = streams.get(streamId);
+      if (s) closeStream(s, false);
+    }
+  }
+
+  async function connectStream(
+    streamId: number,
+    streamType: number,
+    hostname: string,
+    port: number,
+  ) {
+    if (streamType !== STREAM_TCP) {
+      send(closePacket(streamId, CLOSE_INVALID));
+      return;
+    }
+    const s: Stream = { id: streamId, queue: [], writing: false, closed: false, sent: 0 };
+    streams.set(streamId, s);
+    try {
+      const conn = await Deno.connect({ hostname, port });
+      if (s.closed) {
+        conn.close();
+        return;
+      }
+      s.conn = conn;
+      void readLoop(s);
+    } catch {
+      streams.delete(streamId);
+      send(closePacket(streamId, CLOSE_UNREACHABLE));
+    }
+  }
+
+  async function readLoop(s: Stream) {
+    const conn = s.conn!;
+    const buf = new Uint8Array(64 * 1024);
+    try {
+      while (!s.closed) {
+        const n = await conn.read(buf);
+        if (n === null) break;
+        send(makePacket(PACKET_DATA, s.id, buf.slice(0, n)));
+      }
+      send(closePacket(s.id, CLOSE_VOLUNTARY));
+    } catch {
+      send(closePacket(s.id, CLOSE_NETWORK));
+    } finally {
+      closeStream(s, false);
+    }
+  }
+
+  async function pump(s: Stream) {
+    if (s.writing) return;
+    s.writing = true;
+    try {
+      while (s.queue.length && !s.closed) {
+        const chunk = s.queue.shift()!;
+        if (!s.conn) break;
+        await s.conn.write(chunk);
+        s.sent++;
+        // Wisp flow control: the client *sets* its per-stream send budget to the
+        // value we send (it does not add it), and it never sends CONTINUE back
+        // for the server->client direction. So we grant budget as our queue
+        // drains: this replenishes the client's allowance and applies
+        // backpressure when the outbound TCP socket falls behind.
+        const remaining = Math.max(0, BUFFER_SIZE - s.queue.length);
+        send(continuePacket(s.id, remaining));
+      }
+    } catch {
+      send(closePacket(s.id, CLOSE_NETWORK));
+      closeStream(s, false);
+    } finally {
+      s.writing = false;
+    }
+  }
+
+  function closeStream(s: Stream, notify: boolean) {
+    if (s.closed) return;
+    s.closed = true;
+    streams.delete(s.id);
+    try {
+      s.conn?.close();
+    } catch {
+      // already closed
+    }
+    if (notify) send(closePacket(s.id, CLOSE_VOLUNTARY));
+  }
+}
