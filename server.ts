@@ -66,6 +66,57 @@ function infoPacket(): Uint8Array {
   return makePacket(PACKET_INFO, 0, new Uint8Array([2, 0]));
 }
 
+const DIAG_HOSTS = [
+  "www.google.com",
+  "www.bing.com",
+  "play.geforcenow.com",
+  "pcs.geforcenow.com",
+  "github.com",
+];
+
+// GET /diag — attempts outbound TCP connects from *this* Deno Deploy region so we
+// can tell whether the relay's egress can reach a host (both via hostname and via
+// the host's first IPv4 address). Useful when a client fails with a 10s connect
+// timeout that the relay itself cannot reproduce from other regions.
+async function diagConnect(hostname: string, port: number, viaIp: boolean) {
+  const t0 = Date.now();
+  try {
+    let target = hostname;
+    let via = "hostname";
+    if (viaIp) {
+      const a = await Deno.resolveDns(hostname, "A").catch(() => [] as string[]);
+      if (!a.length) return { via: "ipv4", ok: false, ms: Date.now() - t0, err: "no A record" };
+      target = a[0];
+      via = `ipv4:${target}`;
+    }
+    const conn = await withTimeout(Deno.connect({ hostname: target, port }), 8000);
+    try {
+      conn.close();
+    } catch {
+      // ignore
+    }
+    return { via, ok: true, ms: Date.now() - t0 };
+  } catch (e) {
+    return { via: viaIp ? "ipv4" : "hostname", ok: false, ms: Date.now() - t0, err: String((e as Error)?.message ?? e) };
+  }
+}
+
+async function diagResponse(url: URL): Promise<Response> {
+  const one = url.searchParams.get("host");
+  const hosts = one ? [one] : DIAG_HOSTS;
+  const out: Record<string, unknown> = {};
+  await Promise.all(hosts.map(async (h) => {
+    out[h] = await Promise.all([
+      diagConnect(h, 443, false),
+      diagConnect(h, 443, true),
+    ]);
+  }));
+  out["_region"] = Deno.env.get("DENO_REGION") ?? Deno.env.get("DENO_DEPLOYMENT_ID") ?? "unknown";
+  return new Response(JSON.stringify(out, null, 2), {
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
 interface Stream {
   id: number;
   conn?: Deno.TcpConn;
@@ -75,12 +126,14 @@ interface Stream {
   sent: number;
 }
 
-Deno.serve((req: Request): Response => {
+Deno.serve(async (req: Request): Promise<Response> => {
+  const url = new URL(req.url);
   if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    if (url.pathname === "/diag") return await diagResponse(url);
     return new Response("Wisp relay is running.\n", { status: 200 });
   }
   if (WISP_TOKEN) {
-    const token = new URL(req.url).searchParams.get("token");
+    const token = url.searchParams.get("token");
     if (token !== WISP_TOKEN) return new Response("Forbidden", { status: 403 });
   }
 
@@ -189,7 +242,8 @@ function handleSocket(ws: WebSocket, isV2: boolean) {
       // DATA may have arrived while the TCP connect was pending; drain it now.
       void pump(s);
       void readLoop(s);
-    } catch {
+    } catch (e) {
+      console.error(`[wisp] connect ${hostname}:${port} failed: ${(e as Error)?.message ?? e}`);
       streams.delete(streamId);
       send(closePacket(streamId, CLOSE_UNREACHABLE));
     }
@@ -205,7 +259,8 @@ function handleSocket(ws: WebSocket, isV2: boolean) {
         send(makePacket(PACKET_DATA, s.id, buf.slice(0, n)));
       }
       send(closePacket(s.id, CLOSE_VOLUNTARY));
-    } catch {
+    } catch (e) {
+      console.error(`[wisp] read ${s.id} failed: ${(e as Error)?.message ?? e}`);
       send(closePacket(s.id, CLOSE_NETWORK));
     } finally {
       closeStream(s, false);
