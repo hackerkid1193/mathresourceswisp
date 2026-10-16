@@ -217,8 +217,11 @@ function handleSocket(ws: WebSocket, isV2: boolean) {
     s.writing = true;
     try {
       while (s.queue.length && !s.closed) {
-        const chunk = s.queue.shift()!;
+        // Check the connection BEFORE removing the chunk: early DATA (e.g. the
+        // client's TLS ClientHello) can arrive while the TCP connect is still
+        // pending. If we shifted first we would drop that data forever.
         if (!s.conn) break;
+        const chunk = s.queue.shift()!;
         await s.conn.write(chunk);
         s.sent++;
         // Wisp flow control: the client *sets* its per-stream send budget to the
