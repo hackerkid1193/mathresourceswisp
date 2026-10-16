@@ -31,6 +31,18 @@ const CLOSE_UNREACHABLE = 0x42;
 
 const BUFFER_SIZE = 128;
 
+const CONNECT_TIMEOUT_MS = 10000;
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("connect timeout")), ms);
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 function makePacket(type: number, streamId: number, payload: Uint8Array): Uint8Array {
   const out = new Uint8Array(5 + payload.length);
   const view = new DataView(out.buffer);
@@ -168,12 +180,14 @@ function handleSocket(ws: WebSocket, isV2: boolean) {
     const s: Stream = { id: streamId, queue: [], writing: false, closed: false, sent: 0 };
     streams.set(streamId, s);
     try {
-      const conn = await Deno.connect({ hostname, port });
+      const conn = await withTimeout(Deno.connect({ hostname, port }), CONNECT_TIMEOUT_MS);
       if (s.closed) {
         conn.close();
         return;
       }
       s.conn = conn;
+      // DATA may have arrived while the TCP connect was pending; drain it now.
+      void pump(s);
       void readLoop(s);
     } catch {
       streams.delete(streamId);
