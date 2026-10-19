@@ -43,6 +43,19 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// Deno.TcpConn.write may perform a short write (it resolves to the number of
+// bytes actually written). A short write here would silently corrupt the
+// upstream TCP stream and eventually surface as a broken pipe on the client, so
+// loop until every byte is flushed.
+async function writeAll(conn: Deno.TcpConn, data: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < data.length) {
+    const n = await conn.write(data.subarray(offset));
+    if (n === 0) throw new Error("tcp write returned 0");
+    offset += n;
+  }
+}
+
 function makePacket(type: number, streamId: number, payload: Uint8Array): Uint8Array {
   const out = new Uint8Array(5 + payload.length);
   const view = new DataView(out.buffer);
@@ -277,7 +290,7 @@ function handleSocket(ws: WebSocket, isV2: boolean) {
         // pending. If we shifted first we would drop that data forever.
         if (!s.conn) break;
         const chunk = s.queue.shift()!;
-        await s.conn.write(chunk);
+        await writeAll(s.conn, chunk);
         s.sent++;
         // Wisp flow control: the client *sets* its per-stream send budget to the
         // value we send (it does not add it), and it never sends CONTINUE back
@@ -287,7 +300,8 @@ function handleSocket(ws: WebSocket, isV2: boolean) {
         const remaining = Math.max(0, BUFFER_SIZE - s.queue.length);
         send(continuePacket(s.id, remaining));
       }
-    } catch {
+    } catch (e) {
+      console.error(`[wisp] write ${s.id} failed: ${(e as Error)?.message ?? e}`);
       send(closePacket(s.id, CLOSE_NETWORK));
       closeStream(s, false);
     } finally {
